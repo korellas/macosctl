@@ -1,0 +1,43 @@
+## com.korellas.database
+	state = running
+	program = /opt/homebrew/opt/database@16/bin/postgres
+	pid = 101
+	last exit code = (never exited)
+		state = active
+		state = active
+## com.korellas.tracing
+	state = running
+	program = /Users/example/project/run-tracing.sh
+	pid = 102
+	last exit code = (never exited)
+		state = active
+		state = active
+## com.korellas.worker-disabled
+(not loaded)
+## com.korellas.worker-missing
+(not loaded)
+## com.korellas.worker-a
+(not loaded)
+## com.korellas.worker-b
+(not loaded)
+## com.korellas.manual-worker
+(not loaded)
+## com.korellas.gateway
+	state = running
+	program = /Users/example/project/run-gateway.sh
+	pid = 103
+		state = active
+		state = active
+## com.korellas.log-rotate
+	state = not running
+	program = /Users/example/project/scripts/rotate-service-logs.sh
+	last exit code = 0
+		state = active
+		state = active
+## com.webtop
+	state = running
+	program = /Users/example/git/webtop/target/release/webtop
+	pid = 104
+	last exit code = 1
+		state = active
+		state = active

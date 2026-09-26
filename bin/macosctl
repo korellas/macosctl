@@ -1,0 +1,979 @@
+#!/usr/bin/env python3
+"""macosctl — 커스텀 서비스 관리 CLI (관측 + reconcile).
+
+설계 근거: docs/design.md
+
+  macosctl status              선언·등록·실제를 한 표로
+  macosctl doctor              3자 대조 드리프트 진단 (exit 1 = 드리프트 있음)
+  macosctl doctor --fixture D  캡처된 픽스처로 진단 (회귀 테스트용)
+  macosctl logs <name>         해당 서비스의 launchd 로그 꼬리
+  macosctl apply [--dry-run]   매니페스트를 시스템에 수렴 (변경분만, root 필요)
+  macosctl apply --service N   지정 서비스만 수렴 (--service 반복 가능)
+  macosctl apply --adopt       현재 설치본을 인벤토리로 승계 (최초 1회, 멱등)
+  macosctl new <name> ...      새 프로젝트 조각의 서비스 블록 초안을 출력
+  macosctl start|stop <name>        지금 기동/정지 (boot 설정은 그대로)
+  macosctl enable|disable <name>    boot 허용/차단 (지금 상태는 그대로; --now로 함께)
+  macosctl restart <name>           inactive도 최종 active로 (boot 설정 보존)
+
+절차 문서: docs/services.md
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+
+from macosctl import collect  # noqa: E402
+from macosctl import confd  # noqa: E402
+from macosctl import doctor  # noqa: E402
+from macosctl import link as config_link  # noqa: E402
+from macosctl import manifest  # noqa: E402
+from macosctl import model  # noqa: E402
+from macosctl import policy  # noqa: E402
+from macosctl import render  # noqa: E402
+from macosctl import status as status_view  # noqa: E402
+
+LOG_DIR = Path.home() / "Library" / "Logs" / "services"
+
+# --wait의 기본 상한. 기본 start/restart는 새 PID까지만 기다리고, 장기 포트
+# readiness(모델 가중치 로딩 등)는 --wait을 명시했을 때만 기다린다.
+DEFAULT_WAIT_TIMEOUT_SECONDS = 300
+WAIT_POLL_SECONDS = 2.0
+
+GREEN, YELLOW, RED, DIM, RESET = (
+    "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m",
+)
+
+
+# 이 CLI의 사용자 표면이 runtime / boot policy / 정의 세 축의 정본이다. README와
+# docs/services.md는 이것을 설명할 뿐, 다른 의미론을 발명하지 않는다.
+COMMAND_GUIDE = """명령 고르기:
+  runtime 제어    start / stop / restart — 지금 상태만 바꾼다.
+                  apply 불필요, boot 설정(enable/disable) 보존
+  boot policy     enable / disable — 재부팅 뒤에 뜰지만 정한다.
+                  apply 불필요, 지금 상태 보존, 함께 하려면 --now
+  정의 변경       link / unlink / edit / mask / unmask — 선언을 바꾼 뒤
+                  macosctl apply --dry-run 으로 확인하고 sudo macosctl apply
+  진단            status / doctor / logs
+
+runtime/boot 제어는 sudo 없이 실행한다. CLI가 NOPASSWD sudo로 helper만 호출한다.
+여러 서비스: macosctl stop <name> [<name> ...]
+
+자세히: macosctl <command> --help"""
+
+CONTROL_GUIDE = """서비스 이름은 여러 개 지정할 수 있다. 입력 순서대로 처리하고 중복은 한 번만 실행한다.
+이름은 실행 전에 모두 확인한다. 실행 중 실패하면 즉시 멈추며 앞선 성공은 되돌리지 않는다.
+옵션은 모든 대상에 적용되며 --wait의 --timeout은 서비스별 상한이다.
+sudo 없이 실행한다. 설치된 NOPASSWD 규칙으로 helper만 권한 상승한다."""
+
+VERB_CONTRACT = {
+    "start": """지금 기동한다 (runtime).
+
+boot 설정(enable/disable)은 그대로 둔다. 선언을 바꾸지 않으므로 apply 불필요.
+
+  macosctl start <name>
+  macosctl start <name> --wait               # 선언 포트를 실제로 잡을 때까지
+  macosctl start <name> --wait --timeout 60  # 상한 초 (기본 %d)""",
+    "stop": """지금 정지한다 (runtime).
+
+이번 boot 한정의 stop 의도로 기록되고 boot 설정은 그대로다. 그래서 enable된
+서비스는 재부팅하면 다시 뜬다 — 재부팅을 넘기려면 macosctl disable.
+선언을 바꾸지 않으므로 apply 불필요.
+
+  macosctl stop <name>""",
+    "restart": """최종 상태를 active로 만든다 (runtime).
+
+inactive였어도 기동한다. active면 정상 종료(SIGTERM → 유예 → SIGKILL) 뒤 기동한다.
+boot 설정은 보존한다. 선언을 바꾸지 않으므로 apply 불필요 — 런처 스크립트나
+런처가 읽는 설정을 고쳤을 때 쓰는 명령이 이것이다.
+
+  macosctl restart <name>
+  macosctl restart <name> --force      # 즉시 kill, 정상 종료를 건너뛴다
+  macosctl restart <name> --recreate   # 처음부터 재등록 (--force와 함께 못 쓴다)
+  macosctl restart <name> --wait       # 선언 포트를 실제로 잡을 때까지""",
+    "enable": """boot에 뜨는 것을 허용한다 (boot policy).
+
+지금 상태는 그대로다 — 지금 기동까지 하려면 --now.
+선언을 바꾸지 않으므로 apply 불필요.
+
+  macosctl enable <name>
+  macosctl enable <name> --now   # 허용한 뒤 이어서 start""",
+    "disable": """boot에 뜨는 것을 차단한다 (boot policy).
+
+지금 상태는 그대로다 — 지금 정지까지 하려면 --now.
+선언을 바꾸지 않으므로 apply 불필요.
+
+  macosctl disable <name>
+  macosctl disable <name> --now   # 차단한 뒤 이어서 stop""",
+}
+VERB_CONTRACT["start"] %= DEFAULT_WAIT_TIMEOUT_SECONDS
+
+
+def _state(services, only=None, extra_labels=()):
+    targets = tuple(s for s in services if only is None or s.name in only)
+    labels = tuple(dict.fromkeys(
+        tuple(service.label for service in targets) + tuple(extra_labels)
+    ))
+    return collect.collect_live(
+        labels=labels,
+        ports=tuple(sorted({s.port for s in targets})),
+    )
+
+
+def _load_policy_model(config_root: Path):
+    """Load all engine policy fields and bind identity before mutation/diagnosis."""
+    merged = confd.load(config_root)
+    loaded_policy = policy.read(Path(config_root) / "policy.json")
+    return policy.bind(merged, loaded_policy), loaded_policy
+
+
+def _report_policy_refusal(exc: policy.PolicyRefused) -> int:
+    print(f"{RED}정책 거부{RESET} — {exc.detail}", file=sys.stderr)
+    return 2
+
+
+def _read_policy_for_apply(args):
+    """Permit caller-owned policy only for non-default, non-mutating staging."""
+    path = Path(args.config_root) / "policy.json"
+    if args.dry_run and Path(args.config_root) != confd.CONFIG_ROOT:
+        return policy.read_staging(path)
+    return policy.read(path)
+
+
+def _read_policy_for_manifest(config_root: Path):
+    """Read-only rendering may inspect a caller-owned staging tree."""
+    path = Path(config_root) / "policy.json"
+    if Path(config_root) != confd.CONFIG_ROOT:
+        return policy.read_staging(path)
+    return policy.read(path)
+
+
+def _status_width(raw: str) -> int:
+    try:
+        width = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("폭은 정수여야 한다") from exc
+    if width < 40:
+        raise argparse.ArgumentTypeError("폭은 40 이상이어야 한다")
+    return width
+
+
+def _wait_timeout(raw: str) -> int:
+    try:
+        seconds = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--timeout은 정수 초여야 한다") from exc
+    if seconds < 1:
+        raise argparse.ArgumentTypeError("--timeout은 1 이상이어야 한다")
+    return seconds
+
+
+def cmd_status(args) -> int:
+    services = confd.load(args.config_root).services
+    rows = status_view.build_rows(services, _state(services))
+    if getattr(args, "json", False):
+        sys.stdout.write(status_view.render_json(rows))
+        return 0
+    width = getattr(args, "width", None) or max(
+        40, shutil.get_terminal_size((100, 24)).columns
+    )
+    color = sys.stdout.isatty() and not getattr(args, "no_color", False)
+    sys.stdout.write(status_view.render_text(rows, width=width, color=color))
+    return 0
+
+
+def cmd_doctor(args) -> int:
+    from macosctl import inventory
+
+    try:
+        merged, _ = _load_policy_model(args.config_root)
+    except policy.PolicyRefused as exc:
+        return _report_policy_refusal(exc)
+    services = merged.services
+    if args.fixture:
+        state = collect.collect_fixture(Path(args.fixture))
+        known_inventory = None
+        inventory_finding = None
+    else:
+        inventory_finding = None
+        try:
+            known_inventory = inventory.read()
+        except (inventory.InventoryCorrupt, inventory.InventoryUnreadable) as exc:
+            known_inventory = None
+            code = (
+                "inventory-corrupt"
+                if isinstance(exc, inventory.InventoryCorrupt)
+                else "inventory-unreadable"
+            )
+            inventory_finding = doctor.Finding(
+                code,
+                "inventory",
+                str(exc),
+                "인벤토리 접근/내용을 복구한 뒤 macosctl doctor를 다시 실행할 것",
+            )
+            print(
+                f"{YELLOW}경고: {exc} — inventory 기반 doctor 항목을 건너뛴다.{RESET}",
+                file=sys.stderr,
+            )
+        masked_inventory_labels = (
+            tuple(
+                label for label, entry in known_inventory.items()
+                if entry.lifecycle == "masked"
+            )
+            if known_inventory is not None else ()
+        )
+        state = _state(services, extra_labels=masked_inventory_labels)
+
+    findings = doctor.diagnose_merged(merged, state, known_inventory)
+    if inventory_finding is not None:
+        findings += (inventory_finding,)
+
+    for name, dep in manifest.dangling_dependencies(services):
+        findings += (
+            doctor.Finding(
+                "dangling-dependency",
+                name,
+                f"depends_on이 존재하지 않는 서비스 '{dep}'를 가리킨다",
+                "매니페스트에서 참조를 고칠 것",
+            ),
+        )
+
+    if not findings:
+        print(f"{GREEN}드리프트 없음{RESET} — 선언·등록·실제가 일치한다.")
+        _print_override_summary(merged)
+        return 0
+
+    print(f"{YELLOW}드리프트 {len(findings)}건{RESET}\n")
+    for f in findings:
+        print(f"  {RED}{f.code}{RESET}  {f.service}")
+        print(f"    {f.detail}")
+        print(f"    {DIM}→ {f.action}{RESET}")
+    _print_override_summary(merged)
+    return doctor.exit_code(findings)
+
+
+def _print_override_summary(merged) -> None:
+    rows = doctor.override_summary(merged)
+    print(f"\n오버라이드 현황 {len(rows)}건")
+    if not rows:
+        print("  없음")
+        return
+    for row in rows:
+        prior = " → ".join(row.overridden)
+        print(f"  {row.service}.{row.field}: {prior} → {row.winner} (현재 승자)")
+
+
+def cmd_logs(args) -> int:
+    services = {s.name: s for s in confd.load(args.config_root).services}
+    svc = services.get(args.name)
+    if not svc:
+        print(f"그런 서비스가 없다: {args.name}", file=sys.stderr)
+        print(f"가능한 이름: {', '.join(sorted(services))}", file=sys.stderr)
+        return 2
+
+    paths = [LOG_DIR / f"{svc.name}.{kind}.log" for kind in ("err", "out")]
+    existing = [p for p in paths if p.exists()]
+    if not existing:
+        print(f"로그 파일이 없다: {', '.join(str(p) for p in paths)}", file=sys.stderr)
+        return 1
+
+    return subprocess.run(
+        ["/usr/bin/tail", "-n", str(args.lines), *[str(p) for p in existing]]
+    ).returncode
+
+
+def _report_link_error(exc: Exception) -> int:
+    print(f"{RED}{exc}{RESET}", file=sys.stderr)
+    return 2
+
+
+def _apply_guidance() -> None:
+    print("적용하려면 sudo macosctl apply")
+
+
+def _safe_config_error_location(exc: Exception, config_root: Path) -> Path:
+    """Recover only a path token from diagnostics; never echo source values."""
+    root = Path(config_root)
+    detail = getattr(exc, "detail", str(exc))
+    try:
+        candidates = (
+            root / "macosctl.toml", *sorted((root / "conf.d").rglob("*.toml"))
+        )
+    except OSError:
+        return root
+    return next(
+        (
+            candidate for candidate in candidates
+            if str(candidate) in detail or candidate.name in detail
+        ),
+        root,
+    )
+
+
+def _report_config_command_error(
+    command: str,
+    exc: Exception,
+    config_root: Path,
+) -> int:
+    location = _safe_config_error_location(exc, config_root)
+    print(
+        f"{RED}{command} 설정 검증 오류 ({type(exc).__name__}){RESET} — "
+        f"{location}의 설정 경로와 필드 타입을 확인할 것",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def cmd_cat(args) -> int:
+    # D8: a root invocation must stop before following any caller-controlled
+    # fragment symlink. cat has no privileged mode or useful root-only output.
+    if os.geteuid() == 0:
+        print("macosctl cat은 항상 비특권 사용자로 실행해야 한다.", file=sys.stderr)
+        return 2
+    try:
+        merged = confd.load(args.config_root)
+        loaded_policy = _read_policy_for_manifest(args.config_root)
+        merged = policy.bind(merged, loaded_policy)
+        output = config_link.cat(merged, args.config_root, args.name)
+    except config_link.LinkError as exc:
+        return _report_link_error(exc)
+    except (
+        policy.PolicyRefused,
+        OSError,
+        TypeError,
+        ValueError,
+        AttributeError,
+    ) as exc:
+        # Parser diagnostics contain path + line/column, never a source excerpt.
+        return _report_config_command_error("cat", exc, args.config_root)
+    sys.stdout.write(output)
+    return 0
+
+
+def cmd_edit(args) -> int:
+    try:
+        path = config_link.edit(args.name, args.config_root)
+    except config_link.LinkError as exc:
+        return _report_link_error(exc)
+    except (
+        OSError,
+        TypeError,
+        ValueError,
+        AttributeError,
+    ) as exc:
+        return _report_config_command_error("edit", exc, args.config_root)
+    print(f"편집 완료: {path}")
+    _apply_guidance()
+    return 0
+
+
+def cmd_link(args) -> int:
+    try:
+        if args.list:
+            if args.path is not None or args.name is not None:
+                raise config_link.LinkError("link --list에는 path/--name을 함께 쓸 수 없다")
+            rows = config_link.listing(args.config_root)
+            print(f"{'NAME':<24} {'SERVICES':>8}  TARGET")
+            for row in rows:
+                count = "?" if row.services is None else str(row.services)
+                suffix = " (broken)" if row.broken else ""
+                print(f"{row.name:<24} {count:>8}  {row.target}{suffix}")
+            return 0
+        if args.path is None:
+            raise config_link.LinkError("link에는 path가 필요하다 (--list 제외)")
+        destination = config_link.link(args.path, args.config_root, name=args.name)
+    except (
+        config_link.LinkError,
+        OSError,
+        TypeError,
+        ValueError,
+        AttributeError,
+    ) as exc:
+        return _report_link_error(exc)
+    print(f"연결: {destination} -> {destination.resolve()}")
+    _apply_guidance()
+    return 0
+
+
+def cmd_unlink(args) -> int:
+    try:
+        result = config_link.unlink(
+            args.name, args.config_root, purge_dropins=args.purge_dropins
+        )
+    except (config_link.LinkError, OSError) as exc:
+        return _report_link_error(exc)
+    print(f"연결 해제: {result.path}")
+    if result.dropins:
+        if result.purged:
+            print(f"드롭인 삭제: {len(result.dropins)}개")
+        else:
+            print(f"{YELLOW}경고: 고아가 될 드롭인을 남겼다:{RESET}")
+            for path in result.dropins:
+                print(f"  {path}")
+            print("  함께 지우려면 다시 link한 뒤 unlink --purge-dropins")
+    _apply_guidance()
+    return 0
+
+
+def cmd_mask(args) -> int:
+    try:
+        path = config_link.mask(args.name, args.config_root)
+    except config_link.LinkError as exc:
+        return _report_link_error(exc)
+    except (
+        OSError,
+        TypeError,
+        ValueError,
+        AttributeError,
+    ) as exc:
+        return _report_config_command_error("mask", exc, args.config_root)
+    print(f"mask 기록: {path} — 서비스는 아직 실행 중일 수 있다.")
+    _apply_guidance()
+    return 0
+
+
+def cmd_unmask(args) -> int:
+    try:
+        path = config_link.unmask(args.name, args.config_root)
+    except (config_link.LinkError, OSError) as exc:
+        return _report_link_error(exc)
+    print(f"mask 해제: {path}")
+    _apply_guidance()
+    return 0
+
+
+def cmd_manifest(args) -> int:
+    from macosctl import validate
+
+    try:
+        merged = confd.load(args.config_root)
+        loaded_policy = _read_policy_for_manifest(args.config_root)
+        merged = policy.bind(merged, loaded_policy)
+        for warning in merged.warnings:
+            print(f"경고: {warning}", file=sys.stderr)
+        problems = validate.check(
+            merged.services,
+            merged.defaults,
+            label_policy=loaded_policy,
+        )
+        for problem in problems:
+            level = "치명" if problem.fatal else "경고"
+            print(
+                f"{level} {problem.code} {problem.service}: {problem.detail}",
+                file=sys.stderr,
+            )
+        if validate.has_fatal(problems):
+            return 2
+        payload = render.manifest_json(merged)
+    except (
+        policy.PolicyRefused,
+        OSError,
+        TypeError,
+        AttributeError,
+        ValueError,
+    ) as exc:
+        print(f"manifest 오류: {getattr(exc, 'detail', str(exc))}", file=sys.stderr)
+        return 1
+    sys.stdout.write(payload)
+    return 0
+
+
+def cmd_apply(args) -> int:
+    from macosctl import apply
+
+    # A dry-run is immutable and must work for an unprivileged staging tree;
+    # /var/db/macosctl is root-owned, so it deliberately takes no writer lock.
+    if args.dry_run or os.geteuid() != 0:
+        return _cmd_apply_body(args, apply)
+
+    # D10: every authorized writer sees one coherent snapshot.
+    with apply.writer_locked(apply.APPLY_LOCK):
+        return _cmd_apply_body(args, apply)
+
+
+def _cmd_apply_body(args, apply) -> int:
+    from macosctl import inventory
+    from macosctl import validate
+
+    try:
+        merged = confd.load(args.config_root)
+        loaded_policy = _read_policy_for_apply(args)
+        merged = policy.bind(merged, loaded_policy)
+    except policy.PolicyRefused as exc:
+        return _report_policy_refusal(exc)
+
+    services = merged.services
+    defaults = merged.defaults
+
+    problems = validate.check(services, defaults, label_policy=loaded_policy)
+    for p in problems:
+        mark = f"{RED}치명{RESET}" if p.fatal else f"{YELLOW}경고{RESET}"
+        print(f"  {mark} {p.code}  {p.service}: {p.detail}")
+    if validate.has_fatal(problems):
+        print(f"\n{RED}검증 실패 — 아무것도 바꾸지 않았다.{RESET}")
+        return 2
+
+    inv_path = Path(args.inventory) if args.inventory else inventory.DEFAULT_PATH
+    if not args.dry_run and os.geteuid() != 0:
+        print(f"\n{RED}root가 필요하다{RESET} — LaunchDaemon은 /Library/LaunchDaemons에 "
+              f"root 소유로 놓인다.\n  sudo {Path(__file__).resolve()} apply")
+        return 2
+
+    # D7-3: writer lock 안, inventory read/plan/is_noop보다 먼저 승격한다.
+    # dry-run은 이름 그대로 어떤 파일도 바꾸지 않는다.
+    if not args.dry_run:
+        try:
+            inventory._migrate_unlocked(inv_path)
+        except (inventory.InventoryCorrupt, inventory.InventoryUnreadable) as exc:
+            print(f"{RED}{exc}{RESET}")
+            return 2
+        except OSError as exc:
+            print(f"{RED}인벤토리 마이그레이션 기록 실패{RESET}: {exc}", file=sys.stderr)
+            return 1
+
+    unreadable = False
+    try:
+        known = inventory.read(inv_path)
+    except inventory.InventoryUnreadable as exc:
+        # 권한 부족은 손상이 아니다 — 계획은 보여주되 은퇴 판정만 건너뛴다.
+        print(f"{YELLOW}{exc}{RESET}\n  은퇴 판정을 건너뛴다. 전체를 보려면 sudo로 실행할 것.")
+        known, unreadable = None, True
+    except inventory.InventoryCorrupt as exc:
+        print(f"{RED}{exc}{RESET}")
+        return 2
+
+    selected_names = tuple(dict.fromkeys(getattr(args, "service", None) or ()))
+    plan = apply.build_plan(
+        merged, defaults, REPO, known_inventory=known,
+        config_root=Path(args.config_root),
+    )
+    if selected_names:
+        try:
+            plan = apply.select_services(plan, services, selected_names)
+        except apply.ServiceSelectionError as exc:
+            print(f"{RED}선택 적용 거부{RESET} — {exc}", file=sys.stderr)
+            return 2
+        print(f"선택 적용: {', '.join(selected_names)}")
+
+    if plan.inventory_missing and not args.adopt and not unreadable:
+        print(
+            f"{YELLOW}인벤토리가 없다{RESET} ({inv_path}) — 은퇴 판정을 건너뛴다.\n"
+            f"  최초 1회 `sudo {Path(__file__).resolve()} apply --adopt`로 "
+            f"현재 설치본을 승계할 것."
+        )
+
+    print(f"\n생성 {len(plan.create)} / 변경 {len(plan.changed)} / "
+          f"무변경 {len(plan.unchanged)} / 은퇴 {len(plan.retire)} / "
+          f"정지(mask) {len(plan.mask)}")
+    for unit in plan.create:
+        print(f"  {GREEN}+ 생성{RESET} {unit.name}  ({unit.label})")
+    for unit in plan.changed:
+        print(f"  {YELLOW}~ 변경{RESET} {unit.name}  ({unit.label}) — 재기동한다")
+    for label in plan.retire:
+        print(f"  {RED}- 은퇴{RESET} {label}")
+    for label in plan.mask:
+        print(f"  {YELLOW}- 정지(mask){RESET} {label}")
+
+    if args.dry_run:
+        print(f"\n{DIM}--dry-run: 아무것도 바꾸지 않았다.{RESET}")
+        return 0
+
+    if args.adopt:
+        try:
+            members = apply._adopt_unlocked(
+                plan, inventory_path=inv_path, daemon_dir=apply.DAEMON_DIR,
+                known_inventory=known,
+            )
+        except OSError as exc:
+            print(f"{RED}승계 인벤토리 기록 실패{RESET}: {exc}", file=sys.stderr)
+            return 1
+        if not _write_applied_manifest(merged):
+            return 1
+        print(f"\n{GREEN}승계 완료{RESET} — 인벤토리에 {len(members)}개 기록 ({inv_path})")
+        return 0
+
+    if plan.is_noop():
+        if known is not None:
+            try:
+                apply._refresh_unchanged_inventory_unlocked(plan, inv_path, known)
+            except OSError as exc:
+                print(f"{RED}인벤토리 메타데이터 갱신 실패{RESET}: {exc}", file=sys.stderr)
+                return 1
+        if not selected_names and not _write_applied_manifest(merged):
+            return 1
+        print(f"\n{GREEN}변경 없음{RESET} — 재기동 0건.")
+        return 0
+
+    try:
+        result = apply._execute_unlocked(
+            plan, inventory_path=inv_path, daemon_dir=apply.DAEMON_DIR,
+            state_path=apply.state.DEFAULT_PATH, known_inventory=known,
+            lock_path=apply.state.DEFAULT_LOCK, log=print,
+        )
+    except apply.ApplyRefused as exc:
+        # 변경 전에 멈췄다는 뜻이다 — 부분 적용이 아니다.
+        print(f"\n{RED}적용 거부{RESET} — {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"{RED}apply 인벤토리 기록 실패{RESET}: {exc}", file=sys.stderr)
+        return 1
+    print(f"\n등록 {len(result.installed)} / 은퇴 {len(result.retired)} / "
+          f"정지(mask) {len(result.masked)} / "
+          f"실패 {len(result.failed)}")
+    if result.failed:
+        print(f"{RED}부분 실패{RESET} — 위 실패 원인을 확인하고 현재 상태를 "
+              f"다시 진단할 것.")
+    if (
+        result.exit_code() == 0
+        and not selected_names
+        and not _write_applied_manifest(merged)
+    ):
+        return 1
+    return result.exit_code()
+
+
+def _write_applied_manifest(merged) -> bool:
+    try:
+        render.write(merged)
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"{RED}manifest.json 기록 실패{RESET}: {exc}", file=sys.stderr)
+        return False
+    return True
+
+
+SVCCTL = "/usr/local/sbin/macosctl-helper"
+
+
+def _port_is_owned(observed, label: str, port: int) -> bool:
+    """선언 포트를 **launchd job의 자손**이 쥐고 있는가.
+
+    남의 프로세스가 그 포트를 쥔 것을 준비 완료로 읽으면, 아무도 서빙하지 않는
+    상태(duplicate-instance)를 성공으로 보고하게 된다.
+    """
+    job = observed.jobs.get(label)
+    job_pid = job.pid if job else None
+    if not job_pid:
+        return False
+    return any(
+        observed.is_descendant(listener.pid, job_pid)
+        for listener in observed.listeners_on(port)
+    )
+
+
+def _wait_for_port(service, timeout: float) -> int:
+    """helper이 락을 놓은 뒤 CLI가 선언 포트 소유권을 기다린다.
+
+    helper 안에서 기다리면 서비스 락을 그 시간만큼 쥐게 되고, 모델 가중치 로딩처럼
+    분 단위인 준비를 기다리는 동안 다른 제어가 통째로 멎는다.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        observed = collect.collect_live(
+            labels=(service.label,), ports=(service.port,)
+        )
+        if _port_is_owned(observed, service.label, service.port):
+            print(f"{GREEN}준비 완료{RESET} {service.name} :{service.port}")
+            return 0
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(WAIT_POLL_SECONDS)
+
+    print(
+        f"{RED}{int(timeout)}초 안에 :{service.port}을 잡지 못했다{RESET} "
+        f"— macosctl logs {service.name}로 원인을 확인할 것",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def _verb_usage_error(message: str) -> int:
+    print(message, file=sys.stderr)
+    return 2
+
+
+# --now의 두 단계. helper은 한 번에 한 동작만 하므로 합성은 여기서 한다.
+NOW_FOLLOW_UP = {"enable": "start", "disable": "stop"}
+_NOW_REACHED = {
+    "enable": "boot 허용",
+    "disable": "boot 차단",
+}
+_NOW_MISSED = {"enable": "기동", "disable": "정지"}
+
+
+def _run_helper(verb: str, name: str, flags: tuple[str, ...] = ()) -> int:
+    """권한이 필요한 단일 동작 하나를 macosctl-helper에 넘긴다."""
+    result = subprocess.run(["/usr/bin/sudo", "-n", SVCCTL, verb, name, *flags])
+    if result.returncode == 1 and not os.path.exists("/etc/sudoers.d/macosctl"):
+        print(f"{DIM}참고: /etc/sudoers.d/macosctl이 없다면 "
+              f"sudo {REPO}/install.sh 를 먼저 실행할 것.{RESET}",
+              file=sys.stderr)
+    return result.returncode
+
+
+def _run_now_follow_up(command: str, name: str) -> int:
+    """--now의 둘째 단계. 실패는 부분 성공으로 보고하고 롤백하지 않는다."""
+    follow_up = NOW_FOLLOW_UP[command]
+    code = _run_helper(follow_up, name)
+    if code == 0:
+        return 0
+    print(
+        f"{YELLOW}부분 성공{RESET} — {name}: {_NOW_REACHED[command]}은 적용됐으나 "
+        f"이어지는 {_NOW_MISSED[command]}에 실패했다. 롤백하지 않았다.\n"
+        f"  지금 상태를 확인하려면 macosctl status, 다시 시도하려면 "
+        f"macosctl {follow_up} {name}",
+        file=sys.stderr,
+    )
+    return code
+
+
+def cmd_verb(args) -> int:
+    """start/stop/restart/enable/disable — macosctl-helper(root 래퍼) 경유.
+
+    이 CLI는 launchctl을 직접 부르지 않는다. 권한이 필요한 모든 동작은 좁은
+    인터페이스 하나(macosctl-helper)를 지나며, 그 안에서 인벤토리 멤버십으로 인가된다.
+    """
+    force = getattr(args, "force", False)
+    recreate = getattr(args, "recreate", False)
+    now = getattr(args, "now", False)
+    wait = getattr(args, "wait", False)
+    timeout = getattr(args, "timeout", None)
+
+    # 사용법 오류는 설정을 읽기 **전에** 판정한다 — 잘못된 플래그 조합의 진단이
+    # 무관한 설정 오류에 가려지면 안 된다.
+    #
+    # --force는 "지금 것을 즉시 죽인다", --recreate는 "처음부터 다시 등록한다".
+    # 서로 다른 복구 전략이라 동시에 요구하면 무엇을 했는지 보고할 수 없다.
+    if force and recreate:
+        return _verb_usage_error("--force와 --recreate는 함께 쓸 수 없다")
+    if timeout is not None and not wait:
+        return _verb_usage_error("--timeout은 --wait과 함께 쓴다")
+
+    services = {s.name: s for s in confd.load(args.config_root).services}
+    names = tuple(dict.fromkeys(args.names))
+    unknown = [name for name in names if name not in services]
+    if unknown:
+        print(f"그런 서비스가 없다: {', '.join(unknown)}", file=sys.stderr)
+        print(f"가능한 이름: {', '.join(sorted(services))}", file=sys.stderr)
+        return 2
+
+    if not Path(SVCCTL).exists():
+        print(f"{RED}{SVCCTL}가 설치돼 있지 않다{RESET}", file=sys.stderr)
+        print(f"  sudo {REPO}/install.sh", file=sys.stderr)
+        return 2
+
+    flags = tuple(
+        flag for flag, enabled in (("--force", force), ("--recreate", recreate))
+        if enabled
+    )
+    for name in names:
+        code = _run_helper(args.command, name, flags)
+        if code == 0 and now:
+            code = _run_now_follow_up(args.command, name)
+        if code == 0 and wait:
+            # helper이 성공하고 권한 락을 놓은 뒤 서비스별로 기다린다.
+            code = _wait_for_port(
+                services[name],
+                DEFAULT_WAIT_TIMEOUT_SECONDS if timeout is None else timeout,
+            )
+        if code != 0:
+            if len(names) > 1:
+                print(
+                    f"{args.command} {name} 실패 — 이후 대상은 실행하지 않았다. "
+                    "앞선 성공은 되돌리지 않았다.", file=sys.stderr,
+                )
+            return code
+    return 0
+
+
+def cmd_complete_names(args) -> int:
+    # Shell completion must stay instant on every Tab press, so this loads
+    # only the declared config (confd) — never collect_live's launchctl/port
+    # round trips that `status`/`doctor` pay for.
+    names = sorted(s.name for s in confd.load(args.config_root).services)
+    for name in names:
+        print(name)
+    return 0
+
+
+def cmd_new(args) -> int:
+    from macosctl import new as scaffold
+
+    try:
+        merged, loaded_policy = _load_policy_model(args.config_root)
+    except policy.PolicyRefused as exc:
+        return _report_policy_refusal(exc)
+    services = merged.services
+    problems = scaffold.check_conflicts(
+        args.name,
+        args.port,
+        services,
+        group=args.group,
+        label_policy=loaded_policy,
+    )
+    for problem in problems:
+        print(f"  {RED}✗{RESET} {problem}", file=sys.stderr)
+    if problems:
+        return 2
+
+    block = scaffold.render_block(
+        args.name, port=args.port, group=args.group,
+        model=args.model, mem_budget=args.mem_budget,
+        label=policy.resolve_label(args.name, loaded_policy),
+    )
+
+    # D13: macosctl new는 프로젝트 조각 초안만 출력한다. 목적 파일은 프로젝트가
+    # 소유하고 사람이 검토한 뒤 `macosctl link`로 연결한다. 단일 매니페스트 시대의
+    # --write 목적지는 conf.d 구조에는 존재하지 않으므로 임의로 만들지 않는다.
+    print(f"{DIM}프로젝트 service.toml에 넣을 블록:{RESET}\n")
+    print(block)
+    print(scaffold.launcher_hint(args.name, args.group))
+    print("\n다음: 프로젝트 service.toml을 검토한 뒤 `macosctl link <path>`로 연결할 것.")
+    return 0
+
+
+def main(prog: str | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog=prog or Path(sys.argv[0]).name,
+        description=__doc__.splitlines()[0],
+        epilog=COMMAND_GUIDE,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--config-root",
+        type=Path,
+        default=confd.CONFIG_ROOT,
+        help="설정 루트 (기본 /etc/macosctl; 스테이징 검증 때 덮어씀)",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    s = sub.add_parser("status", help="선언·등록·실제를 한 표 또는 JSON으로")
+    s.add_argument("--json", action="store_true", help="Webtop용 안정 JSON 출력")
+    s.add_argument("--no-color", action="store_true", help="ANSI 색상을 끔")
+    s.add_argument("--width", type=_status_width, help="감지한 터미널 폭을 덮어씀")
+    s.set_defaults(fn=cmd_status)
+
+    d = sub.add_parser("doctor", help="3자 대조 드리프트 진단")
+    d.add_argument("--fixture", help="라이브 대신 캡처된 픽스처 디렉터리로 진단")
+    d.set_defaults(fn=cmd_doctor)
+
+    a = sub.add_parser("apply", help="선언에서 생성되는 plist 변경만 반영")
+    a.add_argument("--dry-run", action="store_true", help="할 일만 출력")
+    scope = a.add_mutually_exclusive_group()
+    scope.add_argument("--adopt", action="store_true",
+                       help="현재 설치본을 인벤토리로 승계 (전부 아니면 전무, 멱등)")
+    scope.add_argument(
+        "--service", action="append", metavar="NAME",
+        help="지정 서비스만 적용 (반복 가능; 전체 설정 검증은 유지)",
+    )
+    a.add_argument("--inventory", help="인벤토리 경로 (기본 /var/db/macosctl/inventory)")
+    a.set_defaults(fn=cmd_apply)
+
+    m = sub.add_parser("manifest", help="병합 매니페스트를 안정된 JSON으로 출력")
+    m.add_argument("--json", action="store_true", required=True)
+    m.set_defaults(fn=cmd_manifest)
+
+    l = sub.add_parser("logs", help="서비스 로그 꼬리")
+    l.add_argument("name")
+    l.add_argument("--lines", type=int, default=50)
+    l.set_defaults(fn=cmd_logs)
+
+    c = sub.add_parser("cat", help="병합된 서비스 설정과 출처를 표시")
+    c.add_argument("name")
+    c.set_defaults(fn=cmd_cat)
+
+    e = sub.add_parser("edit", help="70-local.toml을 $EDITOR로 편집")
+    e.add_argument("name")
+    e.set_defaults(fn=cmd_edit)
+
+    lk = sub.add_parser("link", help="프로젝트 조각 심링크를 관리")
+    lk.add_argument("path", nargs="?")
+    lk.add_argument("--name", help="conf.d에서 사용할 basename")
+    lk.add_argument("--list", action="store_true", help="연결된 조각과 서비스 수")
+    lk.set_defaults(fn=cmd_link)
+
+    ul = sub.add_parser("unlink", help="프로젝트 조각 심링크만 제거")
+    ul.add_argument("name")
+    ul.add_argument(
+        "--purge-dropins", action="store_true",
+        help="고아가 될 머신 드롭인도 명시적으로 삭제",
+    )
+    ul.set_defaults(fn=cmd_unlink)
+
+    mk = sub.add_parser("mask", help="서비스를 다음 apply에서 정지")
+    mk.add_argument("name")
+    mk.set_defaults(fn=cmd_mask)
+
+    um = sub.add_parser("unmask", help="서비스 mask를 해제")
+    um.add_argument("name")
+    um.set_defaults(fn=cmd_unmask)
+
+    cn = sub.add_parser(
+        "_complete-names", help="쉘 자동완성용 서비스 이름 목록 (내부용)"
+    )
+    cn.set_defaults(fn=cmd_complete_names)
+
+    n = sub.add_parser("new", help="새 서비스 블록을 만들어 준다")
+    n.add_argument("name")
+    n.add_argument("--port", type=int, required=True)
+    n.add_argument("--group", required=True)
+    n.add_argument("--model", help="mlx 그룹의 HuggingFace 모델 ID")
+    n.add_argument("--mem-budget", dest="mem_budget", help='예: "48GB"')
+    n.set_defaults(fn=cmd_new)
+
+    # 도움말 한 줄이 곧 계약이다: 어느 축(runtime / boot policy)을 바꾸는지.
+    for verb, help_text in (
+        ("start", "지금 기동, boot 변경 없음"),
+        ("stop", "지금 정지, boot 변경 없음"),
+        ("restart", "inactive도 start, boot 보존"),
+        ("enable", "boot 허용, 지금 시작은 --now"),
+        ("disable", "boot 차단, 지금 정지는 --now"),
+    ):
+        v = sub.add_parser(
+            verb,
+            help=help_text,
+            description=VERB_CONTRACT[verb],
+            epilog=CONTROL_GUIDE,
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+        v.add_argument("names", nargs="+", metavar="name", help="대상 서비스 이름 (복수 가능)")
+        if verb == "restart":
+            v.add_argument("--force", action="store_true",
+                           help="kickstart -k (즉시 kill — 정상 종료를 건너뛴다)")
+            v.add_argument("--recreate", action="store_true",
+                           help="처음부터 완전 재등록 (--force와 함께 쓸 수 없다)")
+        if verb in ("enable", "disable"):
+            v.add_argument(
+                "--now", action="store_true",
+                help="boot 설정을 바꾼 뒤 이어서 %s"
+                     % ("기동" if verb == "enable" else "정지"),
+            )
+        if verb in ("start", "restart"):
+            v.add_argument("--wait", action="store_true",
+                           help="선언 포트를 실제로 잡을 때까지 기다린다")
+            v.add_argument("--timeout", type=_wait_timeout,
+                           help=f"--wait 상한 초 (기본 {DEFAULT_WAIT_TIMEOUT_SECONDS})")
+        v.set_defaults(fn=cmd_verb)
+
+    args = parser.parse_args()
+    # 인자 없는 첫 실행은 usage 오류(exit 2)가 아니라 전체 도움말이다. 이 CLI를
+    # 처음 만나는 사람/에이전트가 보게 되는 유일한 화면이라, 여기서 명령을 고를 수
+    # 있어야 한다.
+    if args.command is None:
+        parser.print_help()
+        return 0
+    try:
+        return args.fn(args)
+    except (confd.FragmentUnreadable, model.MergeError) as exc:
+        return _report_config_command_error(args.command, exc, args.config_root)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

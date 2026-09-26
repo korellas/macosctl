@@ -1,0 +1,5 @@
+200 1 00:01:00 tmux new-session -d -s workers
+103 1 00:01:00 /usr/bin/python3 -m example.gateway --port 14000
+201 200 00:01:00 /usr/bin/python3 -m example.worker --port 18001
+202 204 00:01:00 /usr/bin/python3 -m example.gateway --port 14000
+203 200 00:01:00 /usr/bin/python3 -m example.worker --port 18002

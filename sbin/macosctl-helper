@@ -1,0 +1,1010 @@
+#!/usr/bin/env python3
+"""macosctl-helper — LaunchDaemon 제어를 위한 root 래퍼. NOPASSWD sudo로 호출된다.
+
+설계 근거: docs/design.md
+
+  macosctl-helper <start|stop|restart|enable|disable> <name> [--force] [--recreate]
+
+  start/stop  runtime만 바꾼다 — boot policy는 그대로 둔다.
+  enable/disable  boot policy만 바꾼다 — runtime은 그대로 둔다.
+  성공 판정은 launchctl 반환코드가 아니라 **후조건 재관측**이다.
+
+  **한 번의 호출은 한 동작이다.** "boot 허용하고 지금 띄운다" 같은 복합 UX는
+  여기서 합성하지 않는다 — 합성하기 시작하면 NOPASSWD root 경계가 사용자 편의를
+  따라 넓어진다. 그 합성은 비특권 CLI(bin/macosctl)가 두 번 호출하는 것으로 하고,
+  helper은 매 호출마다 단일 동작을 따로 인가·실행한다.
+
+설치: /usr/local/sbin/macosctl-helper (root:wheel 0755) — install.sh
+sudoers 예: example ALL=(root) NOPASSWD: /usr/local/sbin/macosctl-helper   (와일드카드 0개)
+
+────────────────────────────────────────────────────────────────────────────────
+이 파일은 **자기완결형이어야 한다.** 사용자 소유 레포의 모듈을 절대 import하지
+않는다.
+
+이유: 이 스크립트는 NOPASSWD로 root 실행된다. 레포는 사용자 쓰기 가능이므로,
+여기서 레포 코드를 읽으면 그 파일을 고칠 수 있는 프로세스(탈취된 세션, 악성
+의존성 등)가 곧 무비밀번호 root를 얻는다. 1R 적대적 리뷰가 CRITICAL로 잡은
+결함이 정확히 이 형태였다 — 그때는 사용자 소유 검증 **데이터**가 원인이었고,
+여기서는 **코드**가 그렇게 될 뻔했다. 둘 다 root 통제여야 한다.
+`tests/test_macosctl_helper.py`가 이 규칙을 테스트로 고정한다.
+
+인가도 같은 원칙이다. "root 소유 plist가 있다"는 **누가 설치했는지를 증명하지
+않는다** — 다른 root 절차가 놓은 com.korellas.* 도 통과해 버린다. 그래서 root
+소유 인벤토리의 멤버십 + plist 해시 일치를 요구한다.
+────────────────────────────────────────────────────────────────────────────────
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import syslog
+import time
+try:
+    import grp
+except ImportError:  # pragma: no cover - supported macOS always provides grp
+    grp = None
+from pathlib import Path
+from types import MappingProxyType
+from typing import Mapping
+
+DAEMON_DIR = Path("/Library/LaunchDaemons")
+POLICY = Path("/etc/macosctl/policy.json")
+INVENTORY = Path("/var/db/macosctl/inventory")
+STATE = Path("/var/db/macosctl/state")
+LOCK = Path("/var/db/macosctl/lock")
+
+# 감사 기록은 파일에 남기며 syslog도 함께 호출한다.
+AUDIT_LOG = Path("/var/log/macosctl-helper.log")
+
+NAME_PATTERN = re.compile(r"^[a-z0-9-]{1,40}$")
+LABEL_PREFIX_PATTERN = re.compile(
+    r"^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.){1,8}$"
+)
+LABEL_PATTERN = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
+    r"(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?){1,8}$"
+)
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+VERBS = ("start", "stop", "restart", "enable", "disable")
+MAX_POLICY_BYTES = 64 * 1024
+try:
+    WHEEL_GID = grp.getgrnam("wheel").gr_gid if grp is not None else 0
+except KeyError:  # pragma: no cover - portability for non-macOS test hosts
+    WHEEL_GID = 0
+
+# graceful restart의 유예. 이 시간 안에 안 죽으면 SIGKILL로 승격한다.
+TERM_GRACE_SECONDS = 10
+# 후조건 재관측의 상한. 성공은 반환코드가 아니라 이 안에서 관측된 사실이다.
+ACTIVATION_TIMEOUT_SECONDS = 60
+ABSENCE_TIMEOUT_SECONDS = 30
+POLL_INTERVAL_SECONDS = 0.3
+# launchctl print의 실측 반환코드: 0=존재, 113=없음, 그 밖=오류(fail-closed).
+JOB_ABSENT_RC = 113
+
+
+def resolve_verb(verb: str) -> str | None:
+    return verb if verb in VERBS else None
+
+
+class PolicyRefused(Exception):
+    """The root-controlled label policy could not be trusted or validated."""
+
+
+class Policy:
+    __slots__ = ("label_prefix", "label_exceptions")
+
+    def __init__(self, label_prefix: str, label_exceptions: Mapping[str, str]):
+        self.label_prefix = label_prefix
+        self.label_exceptions = MappingProxyType(dict(label_exceptions))
+
+
+def _parse_policy(raw: bytes, path: Path) -> Policy:
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise PolicyRefused(f"정책 JSON 파싱 실패 ({path}): {exc}") from exc
+    if not isinstance(data, dict):
+        raise PolicyRefused(f"정책 JSON은 객체여야 한다 ({path})")
+    if type(data.get("schema")) is not int or data["schema"] != 1:
+        raise PolicyRefused(
+            f"지원하지 않는 policy schema ({path}): {data.get('schema')!r}"
+        )
+    for field in ("label_prefix", "label_exceptions"):
+        if field not in data:
+            raise PolicyRefused(f"정책 필수 필드가 없다 ({path}): {field}")
+
+    prefix = data["label_prefix"]
+    if not isinstance(prefix, str) or LABEL_PREFIX_PATTERN.fullmatch(prefix) is None:
+        raise PolicyRefused(f"잘못된 label_prefix ({path}): {prefix!r}")
+
+    exceptions = data["label_exceptions"]
+    if not isinstance(exceptions, dict):
+        raise PolicyRefused(f"label_exceptions는 객체여야 한다 ({path})")
+    for name, label in exceptions.items():
+        if not isinstance(name, str) or NAME_PATTERN.fullmatch(name) is None:
+            raise PolicyRefused(
+                f"잘못된 label_exceptions 서비스 이름 ({path}): {name!r}"
+            )
+        if not isinstance(label, str) or LABEL_PATTERN.fullmatch(label) is None:
+            raise PolicyRefused(
+                f"잘못된 label_exceptions 라벨 ({path}, {name}): {label!r}"
+            )
+
+    # service_user/groups 및 향후 엔진 키는 의도적으로 검사하지 않는다. macosctl-helper의
+    # 권한 경계는 schema와 label mapping뿐이며 엔진 확장이 제어를 막으면 안 된다.
+    return Policy(prefix, exceptions)
+
+
+def _read_policy(
+    path: Path,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+    expected_directory_uid: int | None = None,
+    expected_directory_gid: int | None = None,
+) -> Policy:
+    """Open the directory and policy once, then inspect/read those same FDs."""
+    path = Path(path)
+    directory_uid = (
+        expected_uid if expected_directory_uid is None else expected_directory_uid
+    )
+    directory_gid = (
+        expected_gid if expected_directory_gid is None else expected_directory_gid
+    )
+    directory_flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_DIRECTORY"):
+        directory_flags |= os.O_DIRECTORY
+    try:
+        directory_fd = os.open(str(path.parent), directory_flags)
+    except OSError as exc:
+        raise PolicyRefused(
+            f"설정 디렉터리를 안전하게 열 수 없다 ({path.parent}): {exc}"
+        ) from exc
+
+    try:
+        directory_stat = os.fstat(directory_fd)
+        if not stat.S_ISDIR(directory_stat.st_mode):
+            raise PolicyRefused(f"설정 디렉터리가 디렉터리가 아니다 ({path.parent})")
+        if directory_stat.st_uid != directory_uid:
+            raise PolicyRefused(f"설정 디렉터리가 root 소유가 아니다 ({path.parent})")
+        if directory_stat.st_gid != directory_gid:
+            raise PolicyRefused(f"설정 디렉터리가 wheel 그룹이 아니다 ({path.parent})")
+        if stat.S_IMODE(directory_stat.st_mode) != 0o755:
+            raise PolicyRefused(f"설정 디렉터리 권한이 0755가 아니다 ({path.parent})")
+
+        try:
+            fd = os.open(
+                path.name,
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+        except FileNotFoundError as exc:
+            raise PolicyRefused(f"정책이 없다 ({path}) — sudo install.sh 먼저") from exc
+        except OSError as exc:
+            raise PolicyRefused(f"정책을 안전하게 열 수 없다 ({path}): {exc}") from exc
+
+        try:
+            policy_stat = os.fstat(fd)
+            if not stat.S_ISREG(policy_stat.st_mode):
+                raise PolicyRefused(f"{path}가 일반 파일이 아니다")
+            if policy_stat.st_uid != expected_uid:
+                raise PolicyRefused(f"{path}가 root 소유가 아니다")
+            if policy_stat.st_gid != expected_gid:
+                raise PolicyRefused(f"{path}가 wheel 그룹이 아니다")
+            if stat.S_IMODE(policy_stat.st_mode) != 0o644:
+                raise PolicyRefused(f"{path} 권한이 0644가 아니다")
+            if policy_stat.st_nlink != 1:
+                raise PolicyRefused(f"{path}의 link count가 1이 아니다")
+            if policy_stat.st_size > MAX_POLICY_BYTES:
+                raise PolicyRefused(f"{path}가 너무 크다 ({policy_stat.st_size}B)")
+
+            chunks: list[bytes] = []
+            remaining = MAX_POLICY_BYTES + 1
+            while remaining:
+                chunk = os.read(fd, min(8192, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+            if len(raw) > MAX_POLICY_BYTES:
+                raise PolicyRefused(f"{path}가 읽는 동안 크기 상한을 넘었다")
+        finally:
+            os.close(fd)
+    finally:
+        os.close(directory_fd)
+    return _parse_policy(raw, path)
+
+
+def read_policy(path: Path = POLICY) -> Policy:
+    return _read_policy(Path(path), expected_uid=0, expected_gid=WHEEL_GID)
+
+
+def resolve_label(name: str, policy: Policy) -> str | None:
+    """name → policy-owned label without consulting user-controlled data.
+
+    정규식이 점·슬래시·공백을 배제하므로 라벨 탈출이 불가능하다.
+    """
+    if not isinstance(name, str):
+        return None
+    exception = policy.label_exceptions.get(name)
+    if exception is not None:
+        return exception if LABEL_PATTERN.fullmatch(exception) is not None else None
+    if NAME_PATTERN.fullmatch(name) is None:
+        return None
+    label = f"{policy.label_prefix}{name}"
+    return label if LABEL_PATTERN.fullmatch(label) is not None else None
+
+
+def sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _inventory_entry(
+    label: str, inventory: Path
+) -> tuple[dict[str, object] | None, str | None]:
+    """Normalize a v1/v2 entry, failing closed on any schema corruption."""
+    try:
+        raw = json.loads(inventory.read_text())
+        if not isinstance(raw, dict) or not isinstance(raw.get("labels"), dict):
+            raise TypeError
+        version = raw.get("version")
+        if type(version) is not int or version not in (1, 2):
+            return None, f"지원하지 않는 인벤토리 버전 ({inventory}): {version!r}"
+        normalized: dict[str, dict[str, object]] = {}
+        for member_label, value in raw["labels"].items():
+            if not isinstance(member_label, str):
+                raise TypeError
+            if version == 1:
+                if not isinstance(value, str) or SHA256_PATTERN.fullmatch(value) is None:
+                    raise TypeError
+                normalized[member_label] = {
+                    "sha256": value, "lifecycle": "active"
+                }
+                continue
+            if not isinstance(value, dict):
+                raise TypeError
+            if not all(key in value for key in ("sha256", "lifecycle")):
+                raise TypeError
+            sha256 = value.get("sha256")
+            lifecycle = value.get("lifecycle")
+            if lifecycle not in ("active", "masked"):
+                raise TypeError
+            if lifecycle == "active":
+                if not isinstance(sha256, str) or SHA256_PATTERN.fullmatch(sha256) is None:
+                    raise TypeError
+            elif sha256 is not None:
+                raise TypeError
+            normalized[member_label] = {
+                "sha256": sha256, "lifecycle": lifecycle
+            }
+    except FileNotFoundError:
+        return None, f"인벤토리가 없다 ({inventory}) — `sudo macosctl apply --adopt` 먼저"
+    except (json.JSONDecodeError, KeyError, TypeError, OSError):
+        return None, f"인벤토리를 해석할 수 없다 ({inventory})"
+
+    if label not in normalized:
+        return None, f"{label}은 인벤토리에 없다 — svc가 설치한 서비스가 아니다"
+    return normalized[label], None
+
+
+def _authorize_active_entry(
+    label: str, daemon_dir: Path, entry: dict[str, object]
+) -> str | None:
+    if entry["lifecycle"] != "active":
+        return f"{label}은 active 서비스가 아니다"
+
+    target = daemon_dir / f"{label}.plist"
+    if target.is_symlink():
+        return f"{target}이 심링크다"
+    if not target.is_file():
+        return f"{target}이 없다"
+    if sha256_file(target) != entry["sha256"]:
+        return f"{target}이 인벤토리 기록 이후 변경됐다 — `sudo macosctl apply` 먼저"
+    return None
+
+
+def authorize(label: str, daemon_dir: Path, inventory: Path) -> str | None:
+    """Authorize an active entry from either inventory version."""
+    entry, denial = _inventory_entry(label, inventory)
+    if denial:
+        return denial
+    assert entry is not None
+    return _authorize_active_entry(label, daemon_dir, entry)
+
+
+def _job_absence(label: str) -> tuple[bool | None, str]:
+    try:
+        result = _launchctl("print", f"system/{label}")
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"launchd job 부재를 확인할 수 없다: {exc}"
+    if result.returncode == 0:
+        return False, "launchd job이 있다"
+    # launchctl의 도메인 내 미등록 서비스 반환값. 다른 실패를 부재로 오인하면
+    # fail-open이므로 오직 이 값만 확정 부재로 취급한다.
+    if result.returncode == 113:
+        return True, ""
+    return None, (
+        "launchd job 부재를 확인할 수 없다 "
+        f"(exit={result.returncode}): {result.stderr.strip()}"
+    )
+
+
+def _authorize_masked_entry(
+    label: str,
+    daemon_dir: Path,
+    entry: dict[str, object],
+    *,
+    verb: str,
+) -> str | None:
+    if entry["lifecycle"] != "masked" or entry["sha256"] is not None:
+        return f"{label}의 masked 인벤토리 조합이 잘못됐다"
+    if verb in ("start", "restart", "enable"):
+        return f"masked 서비스에는 {verb}를 실행할 수 없다"
+    if verb not in ("stop", "disable"):
+        return f"masked 서비스에 허용되지 않은 동사: {verb}"
+
+    target = daemon_dir / f"{label}.plist"
+    # exists()는 깨진 심링크를 놓치므로 lstat로 경로 엔트리 자체의 부재를 본다.
+    try:
+        target.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        return f"masked plist 부재를 확인할 수 없다 ({target}): {exc}"
+    else:
+        return f"masked 서비스의 plist가 존재한다 ({target})"
+
+    absent, detail = _job_absence(label)
+    if absent is not True:
+        return detail
+    return None
+
+
+def authorize_masked(
+    label: str, daemon_dir: Path, inventory: Path, *, verb: str
+) -> str | None:
+    entry, denial = _inventory_entry(label, inventory)
+    if denial:
+        return denial
+    assert entry is not None
+    return _authorize_masked_entry(label, daemon_dir, entry, verb=verb)
+
+
+# --- launchctl 호출 (셸 없이 argv 배열로만) ----------------------------------------
+
+
+def _launchctl(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["/bin/launchctl", *args], capture_output=True, text=True,
+        timeout=90, check=False,
+    )
+
+
+def _job_pid(label: str) -> int | None:
+    result = _launchctl("print", f"system/{label}")
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("pid = "):
+            value = stripped[len("pid = "):].strip()
+            return int(value) if value.isdigit() else None
+    return None
+
+
+def _job_loaded(label: str) -> bool | None:
+    """도메인에 잡이 있는가. 관측 불가는 None (fail-closed 판단은 호출자 몫)."""
+    try:
+        result = _launchctl("print", f"system/{label}")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode == 0:
+        return True
+    if result.returncode == JOB_ABSENT_RC:
+        return False
+    return None
+
+
+_OVERRIDE_PATTERN = re.compile(r'"([^"]+)"\s*=>\s*(\w+)')
+
+
+def _boot_disabled(label: str) -> bool | None:
+    """**실제** boot policy 정본은 launchd다 — state 파일이 아니다.
+
+    관측할 수 없으면 None을 돌려 호출자가 변경 전에 멈추게 한다. 관측 불가를
+    "enabled"로 낮추면 start가 boot policy를 조용히 바꿔 버린다.
+    """
+    try:
+        result = _launchctl("print-disabled", "system")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in (result.stdout or "").splitlines():
+        match = _OVERRIDE_PATTERN.search(line)
+        if match and match.group(1) == label:
+            return match.group(2).lower() == "disabled"
+    return False
+
+
+def _wait_for_pid(
+    label: str, *, exclude: int | None = None, timeout: float
+) -> int | None:
+    """새 PID가 보일 때까지 기다린다. 성공 판정은 반환코드가 아니라 이것이다."""
+    deadline = time.monotonic() + timeout
+    while True:
+        pid = _job_pid(label)
+        if pid is not None and pid != exclude:
+            return pid
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+
+def _wait_for_absence(label: str, *, timeout: float) -> bool:
+    """bootout은 비동기다 — 도메인에서 사라진 것을 확인해야 정지 성공이다."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if _job_loaded(label) is False:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+
+def _terminate_process(pid: int) -> tuple[bool, str]:
+    """SIGTERM → 유예 → SIGKILL. 프로세스가 사라졌으면 True.
+
+    kickstart -k는 즉시 kill이라 모델 서버의 정상 종료를 건너뛴다. 기본은
+    graceful로 두고 --force일 때만 kickstart를 쓴다.
+    """
+    try:
+        os.kill(pid, 15)
+    except ProcessLookupError:
+        return True, "이미 종료돼 있었다"
+    except OSError as exc:
+        return False, f"SIGTERM 실패 — {exc}"
+
+    deadline = time.monotonic() + TERM_GRACE_SECONDS
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True, "정상 종료"
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+    try:
+        os.kill(pid, 9)
+    except ProcessLookupError:
+        return True, "정상 종료"
+    except OSError as exc:
+        return False, f"SIGKILL 실패 — {exc}"
+    return True, f"유예 {TERM_GRACE_SECONDS}s 초과 — SIGKILL로 승격"
+
+
+# --- desired state v2 (자기완결형) -------------------------------------------------
+#
+# {"version": 2,
+#  "disabled_by_macosctl": ["label"...],
+#  "stopped": {"label": "kern.bootsessionuuid"...}}
+#
+# stop 의도는 부팅 세션에 묶는다 — 다음 부팅에서 UUID가 달라지면 자동 만료된다.
+# disable은 "macosctl이 그렇게 만들었다"는 출처일 뿐, 실제 정책은 launchd가 갖는다.
+
+
+def _boot_session_uuid() -> str | None:
+    try:
+        result = subprocess.run(
+            ["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+class StateCorrupt(Exception):
+    """state를 해석할 수 없다 — 빈 값으로 낮추지 않는다."""
+
+
+V1_FIELDS = frozenset({"version", "marks"})
+V2_FIELDS = frozenset({"version", "disabled_by_macosctl", "stopped"})
+V1_MARKS = frozenset({"stopped", "disabled"})
+
+
+def _require_state_fields(payload: dict, expected: frozenset) -> None:
+    present = set(payload)
+    missing = expected - present
+    if missing:
+        raise StateCorrupt(f"state 필수 필드가 없다 {sorted(missing)} ({STATE})")
+    unknown = present - expected
+    if unknown:
+        raise StateCorrupt(f"state에 모르는 필드가 있다 {sorted(unknown)} ({STATE})")
+
+
+def _read_state() -> tuple[set, dict]:
+    """v1/v2를 읽어 (disabled provenance, stopped intent)로 정규화한다.
+
+    **파일 없음만 빈 의도다.** 해석 실패를 빈 값으로 낮추면, 그 판단으로 실제
+    launchd를 바꾼 뒤 해석하지 못한 정본을 통째로 덮어쓰게 된다. 패키지 쪽
+    macosctl/state.py와 같은 의미를 따르되, 이 파일은 자기완결형이라 그것을
+    import하지 않고 여기서 다시 쓴다 (NOPASSWD root 경계).
+    """
+    try:
+        raw = STATE.read_bytes()
+    except FileNotFoundError:
+        return set(), {}
+    except OSError as exc:
+        raise StateCorrupt(f"state를 읽을 수 없다 ({STATE}): {exc}") from exc
+
+    try:
+        # UnicodeDecodeError는 ValueError라 OSError 핸들러에 걸리지 않는다.
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise StateCorrupt(f"state가 손상됐다 ({STATE}): {exc}") from exc
+    if not isinstance(payload, dict):
+        raise StateCorrupt(f"state가 손상됐다 ({STATE}): 최상위가 객체가 아니다")
+
+    version = payload.get("version")
+    if type(version) is not int or version not in (1, 2):
+        raise StateCorrupt(f"지원하지 않는 state 버전 ({STATE}): {version!r}")
+
+    if version == 1:
+        _require_state_fields(payload, V1_FIELDS)
+        marks = payload["marks"]
+        if not isinstance(marks, dict):
+            raise StateCorrupt(f"state가 손상됐다 ({STATE}): marks가 객체가 아니다")
+        disabled, legacy_stopped = set(), []
+        for label, value in marks.items():
+            if not isinstance(label, str) or not isinstance(value, str):
+                raise StateCorrupt(f"state가 손상됐다 ({STATE}): marks 항목 타입 오류")
+            if value not in V1_MARKS:
+                raise StateCorrupt(f"state가 손상됐다 ({STATE}): 알 수 없는 마크 {value!r}")
+            (disabled.add(label) if value == "disabled"
+             else legacy_stopped.append(label))
+        if not legacy_stopped:
+            # disabled는 부팅과 무관한 축이다 — UUID 없이도 해석에 문제가 없다.
+            return disabled, {}
+        boot_uuid = _boot_session_uuid()
+        if boot_uuid is None:
+            # 내용이 깨진 것은 아니지만 의미를 정할 수 없다. 빈 의도로 낮추면
+            # v2 승격이 legacy stop 의도를 지운다 — preflight가 여기서 멈춘다.
+            raise StateCorrupt(
+                f"state를 정규화할 수 없다 ({STATE}): v1 stopped "
+                f"{sorted(legacy_stopped)}를 귀속시킬 boot session UUID를 "
+                f"관측할 수 없다"
+            )
+        return disabled, {label: boot_uuid for label in legacy_stopped}
+
+    _require_state_fields(payload, V2_FIELDS)
+    disabled = payload["disabled_by_macosctl"]
+    stopped = payload["stopped"]
+    if not isinstance(disabled, list):
+        raise StateCorrupt(
+            f"state가 손상됐다 ({STATE}): disabled_by_macosctl이 리스트가 아니다"
+        )
+    if not isinstance(stopped, dict):
+        raise StateCorrupt(f"state가 손상됐다 ({STATE}): stopped가 객체가 아니다")
+    if not all(isinstance(label, str) for label in disabled):
+        raise StateCorrupt(
+            f"state가 손상됐다 ({STATE}): disabled_by_macosctl 항목 타입 오류"
+        )
+    if not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in stopped.items()
+    ):
+        raise StateCorrupt(f"state가 손상됐다 ({STATE}): stopped 항목 타입 오류")
+    return set(disabled), dict(stopped)
+
+
+def _write_state(disabled: set, stopped: dict) -> None:
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({
+        "version": 2,
+        "disabled_by_macosctl": sorted(disabled),
+        "stopped": dict(sorted(stopped.items())),
+    }, indent=2) + "\n"
+    tmp = STATE.with_suffix(".tmp")
+    tmp.write_text(payload)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, STATE)
+
+
+def _record_stopped(label: str, boot_uuid: str) -> None:
+    """정지 의도를 기록한다. UUID는 **동작 전에** 확보한 것을 그대로 받는다.
+
+    여기서 다시 읽으면 bootout 전후로 다른 부팅을 가리킬 여지가 생기고, 관측
+    실패 시점도 이미 runtime을 건드린 뒤가 된다.
+    """
+    disabled, stopped = _read_state()
+    _write_state(disabled, {**stopped, label: boot_uuid})
+
+
+def _clear_stopped(label: str) -> None:
+    disabled, stopped = _read_state()
+    if label in stopped:
+        _write_state(disabled, {k: v for k, v in stopped.items() if k != label})
+
+
+def _record_disabled_provenance(label: str) -> None:
+    disabled, stopped = _read_state()
+    if label not in disabled:
+        _write_state(disabled | {label}, stopped)
+
+
+def _clear_disabled_provenance(label: str) -> None:
+    disabled, stopped = _read_state()
+    if label in disabled:
+        _write_state(disabled - {label}, stopped)
+
+
+# --- 동사 구현 --------------------------------------------------------------------
+
+
+def _restore_boot_policy(label: str, was_disabled: bool) -> str | None:
+    """임시 enable을 되돌린다. 복원 실패는 boot policy 변경이므로 보고한다."""
+    if not was_disabled:
+        return None
+    result = _launchctl("disable", f"system/{label}")
+    observed = _boot_disabled(label)
+    if result.returncode != 0 or observed is not True:
+        return (
+            f"{label}: boot 차단(disable) 복원에 실패했다 — "
+            f"지금 boot policy가 허용으로 바뀌어 있다. `macosctl disable {label}` 확인 필요"
+        )
+    return None
+
+
+def _activate(label: str, target: Path, was_disabled: bool) -> tuple[int, str]:
+    """등록→기동. boot-disabled면 임시 enable로 감싸고 반드시 되돌린다.
+
+    이것이 active+disabled를 지원하는 방법이다 — `launchctl disable`은 오버라이드
+    DB만 토글할 뿐 이미 뜬 잡을 내리지 않으므로, enable→bootstrap→disable 순서로
+    "지금 실행 중이지만 부팅 때는 뜨지 않는" 상태를 만들 수 있다.
+    """
+    if was_disabled:
+        enabled = _launchctl("enable", f"system/{label}")
+        if enabled.returncode != 0:
+            return 1, f"{label}: 임시 enable 실패 — {(enabled.stderr or '').strip()}"
+    try:
+        result = _launchctl("bootstrap", "system", str(target))
+        # bootstrap이 실패했고 잡이 등록조차 되지 않았다면 기다릴 이유가 없다.
+        # 기다리면 하드 실패마다 ACTIVATION_TIMEOUT_SECONDS를 통째로 낭비한다.
+        if result.returncode != 0 and _job_loaded(label) is not True:
+            pid = None
+        else:
+            pid = _wait_for_pid(label, timeout=ACTIVATION_TIMEOUT_SECONDS)
+    finally:
+        restore_problem = _restore_boot_policy(label, was_disabled)
+
+    if pid is None:
+        detail = (result.stderr or result.stdout or "").strip()
+        return 1, f"{label}: bootstrap 후 PID를 확인할 수 없다. {detail}".rstrip()
+    if restore_problem:
+        return 1, f"{label} 기동 (pid {pid}) — 다만 {restore_problem}"
+    return 0, f"{label} 기동 (pid {pid})"
+
+
+def _recreate(label: str, target: Path, was_disabled: bool) -> tuple[int, str]:
+    """완전 재등록: bootout → 부재 확인 → bootstrap → 새 PID 확인."""
+    _launchctl("bootout", f"system/{label}")
+    if not _wait_for_absence(label, timeout=ABSENCE_TIMEOUT_SECONDS):
+        return 1, (
+            f"{label}: bootout이 {ABSENCE_TIMEOUT_SECONDS}초 안에 끝나지 않았다 "
+            f"— 재등록을 중단한다"
+        )
+    return _activate(label, target, was_disabled)
+
+
+def perform_start(label: str, target: Path) -> tuple[int, str]:
+    """지금 기동. boot policy는 관측한 그대로 되돌려 놓는다."""
+    was_disabled = _boot_disabled(label)
+    if was_disabled is None:
+        return 1, f"{label}: boot policy를 관측할 수 없다 — 아무것도 바꾸지 않았다"
+
+    pid = _job_pid(label)
+    if pid is not None:
+        _clear_stopped(label)
+        return 0, f"{label} 이미 실행 중 (pid {pid}) — 변경 없음"
+
+    if _job_loaded(label) is True:
+        # loaded-but-no-PID는 bootstrap으로 낫지 않는다 (이미 등록돼 있다).
+        code, message = _recreate(label, target, was_disabled)
+    else:
+        code, message = _activate(label, target, was_disabled)
+    if code == 0:
+        _clear_stopped(label)
+    return code, message
+
+
+def perform_stop(label: str) -> tuple[int, str]:
+    """지금 정지. boot policy와 disable provenance는 손대지 않는다.
+
+    boot session UUID를 **bootout 전에** 확보한다. 뒤에 읽으면 관측 실패가 곧
+    "이미 내려갔는데 의도는 기록되지 않은" 부분 실패가 되고, 다음 apply가 의도
+    없음으로 보고 다시 띄운다.
+    """
+    boot_uuid = _boot_session_uuid()
+    if boot_uuid is None:
+        return 1, (
+            f"{label}: boot session UUID를 읽을 수 없다 — 정지 의도를 기록할 수 "
+            f"없으므로 아무것도 바꾸지 않았다"
+        )
+    result = _launchctl("bootout", f"system/{label}")
+    if not _wait_for_absence(label, timeout=ABSENCE_TIMEOUT_SECONDS):
+        detail = (result.stderr or "").strip()
+        return 1, f"{label}: 정지하지 못했다 — launchd job이 남아 있다. {detail}".rstrip()
+    _record_stopped(label, boot_uuid)
+    return 0, f"{label} 정지 (boot 설정은 그대로 — 부팅 기동을 막으려면 disable)"
+
+
+def perform_restart(
+    label: str, target: Path, *, force: bool, recreate: bool
+) -> tuple[int, str]:
+    """항상 최종 active를 목표로 한다 — inactive면 기동, 실패하면 재등록으로 승격."""
+    was_disabled = _boot_disabled(label)
+    if was_disabled is None:
+        return 1, f"{label}: boot policy를 관측할 수 없다 — 아무것도 바꾸지 않았다"
+
+    if recreate:
+        code, message = _recreate(label, target, was_disabled)
+        if code == 0:
+            _clear_stopped(label)
+        return code, message
+
+    old_pid = _job_pid(label)
+    if old_pid is None:
+        # inactive(미등록) 또는 loaded-but-no-PID — 둘 다 최종 active로 만든다.
+        if _job_loaded(label) is True:
+            code, message = _recreate(label, target, was_disabled)
+        else:
+            code, message = _activate(label, target, was_disabled)
+        if code == 0:
+            _clear_stopped(label)
+        return code, message
+
+    if force:
+        _launchctl("kickstart", "-k", f"system/{label}")
+        detail = "강제 재기동 (kickstart -k)"
+    else:
+        killed, detail = _terminate_process(old_pid)
+        if not killed:
+            detail = f"graceful 종료 실패 ({detail}) — 재등록으로 승격"
+
+    new_pid = _wait_for_pid(
+        label, exclude=old_pid, timeout=ACTIVATION_TIMEOUT_SECONDS
+    )
+    if new_pid is not None:
+        _clear_stopped(label)
+        return 0, f"{label} 재기동 (pid {old_pid} → {new_pid}) — {detail}"
+
+    code, message = _recreate(label, target, was_disabled)
+    if code == 0:
+        _clear_stopped(label)
+        return 0, f"{label} 재기동 실패 후 재등록으로 복구 — {message}"
+    return code, f"{label} 재기동·재등록 모두 실패 — {message}"
+
+
+def perform_enable(label: str) -> tuple[int, str]:
+    """boot 허용만 바꾼다. runtime과 정지 의도는 건드리지 않는다."""
+    result = _launchctl("enable", f"system/{label}")
+    observed = _boot_disabled(label)
+    if observed is None:
+        return 1, f"{label}: enable 후 boot policy를 재확인할 수 없다"
+    if observed:
+        detail = (result.stderr or result.stdout or "").strip()
+        return 1, f"{label}: enable했으나 여전히 boot 차단 상태다. {detail}".rstrip()
+    _clear_disabled_provenance(label)
+    return 0, f"{label} boot 허용 (지금 실행 상태는 그대로다)"
+
+
+def perform_disable(label: str) -> tuple[int, str]:
+    """boot 차단만 바꾼다. bootout하지 않는다 — 정지는 stop 동사의 몫이다."""
+    result = _launchctl("disable", f"system/{label}")
+    observed = _boot_disabled(label)
+    if observed is None:
+        return 1, f"{label}: disable 후 boot policy를 재확인할 수 없다"
+    if not observed:
+        detail = (result.stderr or result.stdout or "").strip()
+        return 1, f"{label}: disable했으나 여전히 boot 허용 상태다. {detail}".rstrip()
+    _record_disabled_provenance(label)
+    return 0, f"{label} boot 차단 (지금 실행 상태는 그대로다)"
+
+
+def _state_preflight(label: str) -> str | None:
+    """launchctl을 건드리기 전에 state 정본을 엄격히 읽어 본다.
+
+    해석하지 못한 채 진행하면 실제 변경을 끝낸 뒤 그 정본을 덮어쓰게 된다 —
+    무엇이 의도였는지 복구할 근거가 그 순간 사라진다.
+    """
+    try:
+        _read_state()
+    except StateCorrupt as exc:
+        return f"{label}: {exc} — 아무것도 바꾸지 않았다"
+    return None
+
+
+def perform(
+    verb: str, label: str, force: bool, *, recreate: bool = False
+) -> tuple[int, str]:
+    """동사 하나를 그대로 실행한다. 여기서 동사를 이어붙이지 않는다."""
+    target = DAEMON_DIR / f"{label}.plist"
+
+    problem = _state_preflight(label)
+    if problem:
+        return 1, problem
+
+    if verb == "start":
+        return perform_start(label, target)
+    if verb == "stop":
+        return perform_stop(label)
+    if verb == "restart":
+        return perform_restart(label, target, force=force, recreate=recreate)
+    if verb == "enable":
+        return perform_enable(label)
+    if verb == "disable":
+        return perform_disable(label)
+
+    return 2, f"알 수 없는 동사: {verb}"
+
+
+def perform_masked(verb: str, label: str) -> tuple[int, str]:
+    """Record only a lowering intent after masked absence was established.
+
+    masked 서비스에는 plist도 job도 없다 — 그래서 여기서 할 수 있는 일은 낮추는
+    의도를 남기는 것뿐이고, bootout/bootstrap은 어느 경우에도 부르지 않는다.
+    active 경로와 마찬가지로 한 호출은 한 동작이며, "disable하고 지금 정지"는
+    CLI가 disable과 stop을 각각 호출해서 얻는다.
+    """
+    if verb not in ("stop", "disable"):
+        return 2, f"masked 서비스에 허용되지 않은 동사: {verb}"
+
+    problem = _state_preflight(label)
+    if problem:
+        return 1, problem
+
+    if verb == "stop":
+        boot_uuid = _boot_session_uuid()
+        if boot_uuid is None:
+            return 1, f"{label}: boot session UUID를 읽지 못해 정지 의도를 기록하지 못했다"
+        _record_stopped(label, boot_uuid)
+        return 0, f"{label} masked 상태에서 정지 의도 기록"
+
+    result = _launchctl("disable", f"system/{label}")
+    if result.returncode != 0:
+        return 1, f"disable 실패: {result.stderr.strip()}"
+    # 실제 boot policy 정본은 print-disabled다 — rc 0은 성공의 증거가 아니다.
+    # active 경로의 disable과 같은 판정을 masked에도 적용한다.
+    observed = _boot_disabled(label)
+    if observed is None:
+        return 1, f"{label}: disable 후 boot policy를 재확인할 수 없다"
+    if not observed:
+        return 1, f"{label}: disable했으나 여전히 boot 허용 상태다"
+    _record_disabled_provenance(label)
+    return 0, f"{label} masked 상태에서 disable 의도 기록"
+
+
+def audit(message: str) -> None:
+    """감사 기록. 파일이 정본이고 syslog는 보조다.
+
+    감사가 실패해도 제어는 계속한다 — 로그를 못 쓴다고 서비스 조작을 막으면,
+    디스크가 찬 상황에서 복구 수단을 잃는다.
+    """
+    syslog.syslog(syslog.LOG_NOTICE, message)
+    try:
+        import datetime
+
+        stamp = datetime.datetime.now().isoformat(timespec="seconds")
+        with AUDIT_LOG.open("a") as fh:
+            fh.write(f"{stamp} {message}\n")
+        os.chmod(AUDIT_LOG, 0o644)
+    except OSError:
+        pass
+
+
+USAGE = (
+    f"사용법: macosctl-helper <{'|'.join(VERBS)}> <name> [--force] [--recreate]"
+)
+FLAGS = ("--force", "--recreate")
+
+
+def main(argv: list[str]) -> int:
+    raw = argv[1:]
+    args = [a for a in raw if not a.startswith("--")]
+    unknown = [a for a in raw if a.startswith("--") and a not in FLAGS]
+    force = "--force" in raw
+    recreate = "--recreate" in raw
+
+    if unknown or len(args) != 2:
+        print(USAGE, file=sys.stderr)
+        return 2
+
+    verb, name = args
+    if resolve_verb(verb) is None:
+        print(f"허용되지 않은 동사: {verb!r}", file=sys.stderr)
+        return 2
+
+    # --force는 "지금 것을 즉시 죽인다", --recreate는 "처음부터 다시 등록한다".
+    # 서로 다른 복구 전략이라 동시에 요구하면 어느 쪽을 했는지 보고할 수 없다.
+    if force and recreate:
+        print("--force와 --recreate는 함께 쓸 수 없다", file=sys.stderr)
+        return 2
+    if recreate and verb != "restart":
+        print(f"--recreate는 restart에만 쓴다 (받은 동사: {verb})", file=sys.stderr)
+        return 2
+    if force and verb != "restart":
+        print(f"--force는 restart에만 쓴다 (받은 동사: {verb})", file=sys.stderr)
+        return 2
+
+    try:
+        label_policy = read_policy()
+    except PolicyRefused as exc:
+        print(f"거부: {exc}", file=sys.stderr)
+        return 3
+
+    label = resolve_label(name, label_policy)
+    if label is None:
+        print(f"허용되지 않은 이름: {name!r}", file=sys.stderr)
+        return 2
+
+    caller = os.environ.get("SUDO_USER", "?")
+    syslog.openlog("macosctl-helper", syslog.LOG_PID, syslog.LOG_DAEMON)
+
+    # apply와 같은 락을 잡는다 — 안 그러면 apply가 낡은 state 스냅샷으로 되살린다.
+    #
+    # **인가도 락 안에서** 한다. 락 밖에서 인벤토리와 plist 해시를 읽으면, 락을
+    # 기다리는 동안 apply가 그 둘을 갈아끼워 인가 근거와 실제 실행 대상이 어긋난다
+    #.
+    import fcntl
+
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(LOCK), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+        entry, denial = _inventory_entry(label, INVENTORY)
+        masked = entry is not None and entry.get("lifecycle") == "masked"
+        if denial is None:
+            assert entry is not None
+            if masked:
+                denial = _authorize_masked_entry(
+                    label, DAEMON_DIR, entry, verb=verb
+                )
+            else:
+                denial = _authorize_active_entry(label, DAEMON_DIR, entry)
+        if denial:
+            audit(f"거부 {verb} {label} (호출 {caller}): {denial}")
+            print(f"거부: {denial}", file=sys.stderr)
+            return 3
+
+        audit(f"실행 {verb} {label} (호출 {caller})")
+        try:
+            if masked:
+                code, message = perform_masked(verb, label)
+            else:
+                code, message = perform(verb, label, force, recreate=recreate)
+        except StateCorrupt as exc:
+            # preflight를 통과한 뒤 손상이 드러난 경우. traceback 대신 통제된 실패로
+            # 끝낸다 — 이 시점의 실제 상태는 메시지가 가리키는 그대로다.
+            code, message = 1, f"state를 해석할 수 없다: {exc}"
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+    audit(f"결과 {verb} {label}: {code} {message}")
+    print(message, file=sys.stderr if code else sys.stdout)
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

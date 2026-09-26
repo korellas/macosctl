@@ -1,0 +1,25 @@
+## port 15432
+COMMAND    PID     USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+postgres 101 example    7u  IPv4 0x0000000000000000      0t0  TCP 127.0.0.1:15432 (LISTEN)
+postgres 101 example    8u  IPv6 0x0000000000000000      0t0  TCP [::1]:15432 (LISTEN)
+## port 16006
+COMMAND     PID     USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+python3.1 102 example   16u  IPv4 0x0000000000000000      0t0  TCP *:16006 (LISTEN)
+## port 18000
+(no listener)
+## port 18001
+COMMAND     PID     USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+python3.1 201 example    4u  IPv4 0x0000000000000000      0t0  TCP 127.0.0.1:18001 (LISTEN)
+## port 18002
+COMMAND     PID     USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+python3.1 203 example    4u  IPv4 0x0000000000000000      0t0  TCP 127.0.0.1:18002 (LISTEN)
+## port 18003
+(no listener)
+## port 13003
+(no listener)
+## port 14000
+COMMAND     PID     USER   FD   TYPE            DEVICE SIZE/OFF NODE NAME
+python3.1 202 example   19u  IPv4 0x0000000000000000      0t0  TCP *:14000 (LISTEN)
+## port 17890
+COMMAND   PID     USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+webtop  104 example   12u  IPv4 0x0000000000000000      0t0  TCP *:17890 (LISTEN)

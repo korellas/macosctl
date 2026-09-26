@@ -1,0 +1,4 @@
+worker-a: 1 windows
+worker-b: 1 windows
+gateway: 1 windows
+workers: 1 windows

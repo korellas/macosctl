@@ -1,0 +1,71 @@
+#compdef macosctl
+# zsh completion for macosctl.
+#
+# Service names come from `macosctl _complete-names`, an internal subcommand
+# (listed in help, marked 내부용) that only loads confd (TOML parse) — never
+# collect_live's launchctl/port round trips — so it stays fast enough to
+# shell out to on every Tab press.
+
+_macosctl_service_names() {
+    local -a config_root_opt
+    [[ -n $config_root ]] && config_root_opt=(--config-root "$config_root")
+
+    local -a names
+    names=(${(f)"$(command macosctl "${config_root_opt[@]}" _complete-names 2>/dev/null)"})
+    _describe -t services 'service' names
+}
+
+_macosctl() {
+    local -a commands
+    commands=(
+        'status:선언·등록·실제를 한 표 또는 JSON으로'
+        'doctor:3자 대조 드리프트 진단'
+        'apply:선언에서 생성되는 plist 변경만 반영'
+        'manifest:병합 매니페스트를 안정된 JSON으로 출력'
+        'logs:서비스 로그 꼬리'
+        'cat:병합된 서비스 설정과 출처를 표시'
+        'edit:70-local.toml을 $EDITOR로 편집'
+        'link:프로젝트 조각 심링크를 관리'
+        'unlink:프로젝트 조각 심링크만 제거'
+        'mask:서비스를 다음 apply에서 정지'
+        'unmask:서비스 mask를 해제'
+        'new:새 서비스 블록을 만들어 준다'
+        'start:지금 기동, boot 변경 없음'
+        'stop:지금 정지, boot 변경 없음'
+        'restart:inactive도 start, boot 보존'
+        'enable:boot 허용, 지금 시작은 --now'
+        'disable:boot 차단, 지금 정지는 --now'
+    )
+
+    local config_root=""
+    local cmd_index=2
+    if [[ ${words[2]} == --config-root ]]; then
+        config_root=${words[3]}
+        cmd_index=4
+    fi
+
+    if (( CURRENT == cmd_index - 1 )); then
+        _directories
+        return
+    fi
+
+    if (( CURRENT == cmd_index )); then
+        _describe -t commands 'macosctl command' commands
+        return
+    fi
+
+    case ${words[cmd_index]} in
+        start|stop|restart|enable|disable)
+            if [[ ${words[CURRENT-1]} != --timeout && ${words[CURRENT]} != -* ]]; then
+                _macosctl_service_names
+            fi
+            ;;
+        logs|cat|edit|unlink|mask|unmask)
+            if (( CURRENT == cmd_index + 1 )); then
+                _macosctl_service_names
+            fi
+            ;;
+    esac
+}
+
+_macosctl "$@"

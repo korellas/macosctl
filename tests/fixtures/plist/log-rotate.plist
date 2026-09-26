@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/example</string>
+		<key>MACOSCTL_CONFIG</key>
+		<string>/etc/macosctl/macosctl.toml</string>
+		<key>PATH</key>
+		<string>/usr/bin:/bin</string>
+	</dict>
+	<key>Label</key>
+	<string>com.korellas.log-rotate</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>Nice</key>
+	<integer>5</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/macosctl/libexec/rotate-service-logs.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/example/Library/Logs/services/log-rotate.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/example/Library/Logs/services/log-rotate.out.log</string>
+	<key>StartInterval</key>
+	<integer>900</integer>
+	<key>UserName</key>
+	<string>example</string>
+	<key>WorkingDirectory</key>
+	<string>/opt/macosctl</string>
+</dict>
+</plist>

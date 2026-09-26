@@ -1,0 +1,93 @@
+# Synthetic regression input; not a live service configuration.
+[defaults]
+user = "example"
+working_directory = "/Users/example/project"
+log_dir = "/Users/example/Library/Logs/services"
+throttle_seconds = 10
+log_max_mb = 20
+log_keep = 5
+log_rotate_interval_seconds = 900
+path = "/usr/bin:/bin"
+
+[[service]]
+name = "database"
+label = "com.korellas.database"
+port = 15432
+group = "infra"
+exec = ["/bin/echo", "database"]
+env = { LC_ALL = "en_US.UTF-8" }
+depends_on = []
+
+[[service]]
+name = "tracing"
+label = "com.korellas.tracing"
+port = 16006
+group = "infra"
+exec = ["/bin/echo", "tracing"]
+depends_on = []
+
+[[service]]
+name = "worker-disabled"
+label = "com.korellas.worker-disabled"
+port = 18003
+group = "mtplx"
+mem_budget = "1GB"
+managed = false
+exec = ["/bin/echo", "worker-disabled"]
+depends_on = []
+
+[[service]]
+name = "worker-missing"
+label = "com.korellas.worker-missing"
+port = 18000
+group = "mtplx"
+mem_budget = "1GB"
+env = { MEMORY_BUDGET = "1GB" }
+exec = ["/bin/echo", "worker-missing"]
+depends_on = []
+
+[[service]]
+name = "worker-a"
+label = "com.korellas.worker-a"
+port = 18001
+group = "mlx"
+mem_budget = "1GB"
+env = { MODEL = "example/worker-a", PORT = "18001", SESSION = "worker-a" }
+exec = ["/bin/echo", "worker-a"]
+depends_on = []
+
+[[service]]
+name = "worker-b"
+label = "com.korellas.worker-b"
+port = 18002
+group = "mlx"
+mem_budget = "1GB"
+env = { MODEL = "example/worker-b", PORT = "18002", SESSION = "worker-b" }
+exec = ["/bin/echo", "worker-b"]
+depends_on = []
+
+[[service]]
+name = "manual-worker"
+label = "com.korellas.manual-worker"
+port = 13003
+group = "llm"
+mem_budget = "1GB"
+managed = false
+exec = ["/bin/echo", "manual-worker"]
+depends_on = []
+
+[[service]]
+name = "gateway"
+label = "com.korellas.gateway"
+port = 14000
+group = "edge"
+exec = ["/bin/echo", "gateway"]
+depends_on = ["database", "tracing"]
+
+[[service]]
+name = "webtop"
+label = "com.webtop"
+port = 17890
+group = "dashboard"
+exec = ["/bin/echo", "webtop"]
+depends_on = []
