@@ -138,10 +138,27 @@ def test_validate_warns_on_memory_budget_overcommit():
                  mem_budget="200GB")
         for i in range(3)
     )
-    with mock.patch("macosctl.validate._physical_memory_gb", return_value=256):
+    with mock.patch("macosctl.validate._physical_memory_gb", return_value=256), \
+         mock.patch("macosctl.validate._boot_disabled_labels", return_value=frozenset()):
         problems = validate.check(big, manifest.load_defaults(MANIFEST))
     over = [p for p in problems if p.code == "memory-overcommit"]
     assert over and over[0].fatal is False, "예산 초과는 경고여야 한다 (중단 아님)"
+
+
+def test_memory_budget_overcommit_excludes_boot_disabled_services():
+    services = (
+        _service(name="live", label="com.korellas.live", port=9100,
+                 mem_budget="20GB"),
+        _service(name="parked", label="com.korellas.parked", port=9101,
+                 mem_budget="200GB"),
+    )
+    with mock.patch("macosctl.validate._physical_memory_gb", return_value=256), \
+         mock.patch("macosctl.validate._boot_disabled_labels",
+                     return_value=frozenset({"com.korellas.parked"})):
+        problems = validate.check(services, manifest.load_defaults(MANIFEST))
+    assert not [p for p in problems if p.code == "memory-overcommit"], (
+        "boot-disabled 서비스의 예산은 합계에서 빠져야 한다"
+    )
 
 
 def test_memory_budget_warning_uses_detected_physical_memory():

@@ -17,6 +17,7 @@ import subprocess
 from dataclasses import dataclass
 
 from macosctl import policy as policy_module
+from macosctl.collect import parse_disabled_overrides
 from macosctl.confd import PROCESS_TYPES
 from macosctl.manifest import Defaults, Service
 
@@ -55,6 +56,25 @@ def _physical_memory_gb() -> float | None:
         return int(result.stdout.strip()) / (1024 ** 3)
     except (OSError, subprocess.CalledProcessError, ValueError):
         return None
+
+
+def _boot_disabled_labels() -> frozenset[str]:
+    """boot-disabled 라벨 집합. 조회 실패는 필터링 없이(=전량 합산) 폴백한다 —
+
+    과소경고보다 과대경고가 안전하다.
+    """
+    try:
+        result = subprocess.run(
+            ("/bin/launchctl", "print-disabled", "system"),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return frozenset()
+    overrides = parse_disabled_overrides(result.stdout)
+    return frozenset(label for label, disabled in overrides.items() if disabled)
 
 
 def check(
@@ -159,13 +179,18 @@ def check(
                             f"env.MEMORY_BUDGET={env['MEMORY_BUDGET']}다")
                 )
 
-    total = sum(_budget_gb(s.mem_budget) for s in services if s.managed)
+    boot_disabled = _boot_disabled_labels()
+    total = sum(
+        _budget_gb(s.mem_budget)
+        for s in services
+        if s.managed and s.label not in boot_disabled
+    )
     physical_memory_gb = _physical_memory_gb()
     if physical_memory_gb is not None and total > physical_memory_gb:
         problems.append(
             Problem("memory-overcommit", "[전체]",
-                    f"managed 선언 예산 합계 {total:.0f}GB > 물리 {physical_memory_gb:g}GB "
-                    f"— 동시 로딩 시 메모리가 부족해질 수 있다",
+                    f"managed+boot-enabled 선언 예산 합계 {total:.0f}GB > 물리 "
+                    f"{physical_memory_gb:g}GB — 동시 로딩 시 메모리가 부족해질 수 있다",
                     fatal=False)
         )
 
